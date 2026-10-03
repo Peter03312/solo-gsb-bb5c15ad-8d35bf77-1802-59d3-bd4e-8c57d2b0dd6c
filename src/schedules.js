@@ -257,6 +257,12 @@ function getScheduleOrThrow(scheduleId, rehearsalId) {
   return s;
 }
 
+/** 到场登记摘要（每时段至多一次登记）；详表见 attendance.js */
+function attendanceBrief(scheduleId) {
+  const row = db.prepare('SELECT id, status FROM attendance_sessions WHERE schedule_id = ?').get(scheduleId);
+  return row ? { id: row.id, status: row.status } : null;
+}
+
 function sceneBrief(sceneId) {
   const scene = db.prepare('SELECT * FROM scenes WHERE id = ?').get(sceneId);
   return { sceneCode: scene?.code ?? null, sceneTitle: scene?.title ?? null };
@@ -275,6 +281,7 @@ function serializeSchedule(s, rehearsal) {
     status: s.status,
     participants,
     pendingCast,
+    attendance: attendanceBrief(s.id),
     createdAt: s.created_at,
     cancelledAt: s.cancelled_at,
   };
@@ -293,6 +300,7 @@ function serializeScheduleForActor(s, rehearsal, actorId) {
     endAt: s.end_at,
     status: s.status,
     myRoles: me?.roles ?? [],
+    attendance: attendanceBrief(s.id),
   };
 }
 
@@ -391,9 +399,16 @@ router.post(
     const r = getRehearsalOrThrow(req.params.id);
     const s = getScheduleOrThrow(req.params.scheduleId, r.id);
     if (s.status === 'cancelled') throw badRequest('该安排已取消');
-    db.prepare("UPDATE rehearsal_schedules SET status = 'cancelled', cancelled_at = datetime('now') WHERE id = ?").run(s.id);
+    transaction(() => {
+      db.prepare("UPDATE rehearsal_schedules SET status = 'cancelled', cancelled_at = datetime('now') WHERE id = ?").run(s.id);
+      // 到场登记联动：开放中的登记随之作废（保留签到痕迹，不计出勤，签到停止）；
+      // 已关闭的登记不动，序列化时以 scheduleCancelled 标注，原统计保留。
+      db.prepare(
+        "UPDATE attendance_sessions SET status = 'void', voided_at = ? WHERE schedule_id = ? AND status = 'open'"
+      ).run(new Date().toISOString(), s.id);
+    });
     res.json({ ok: true, schedule: serializeSchedule(getScheduleOrThrow(s.id, r.id), r) });
   })
 );
 
-module.exports = { router, assertRehearsalSchedulesAfterCastChange, applySchedulesAfterVersionSwitch };
+module.exports = { router, assertRehearsalSchedulesAfterCastChange, applySchedulesAfterVersionSwitch, participantDetails };

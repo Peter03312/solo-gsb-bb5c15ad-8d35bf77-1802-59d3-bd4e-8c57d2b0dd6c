@@ -397,6 +397,107 @@ async function main() {
   await req('PATCH', `/api/rehearsals/${rhA}/schedules/${schA1.id}`, lin, { startAt: '2030-01-01T09:00:00+08:00' }, 403);
   check('未派角演员查看 403；演员不能调整/取消日程', true);
 
+  console.log('— 到场登记：开启冻结 / 签到幂等 / 关闭记缺席 —');
+  // 专用剧本：场次 T1，角色 甲/乙/丙 均有台词；丙不派角 -> 缺口
+  const p3 = await J('/api/plays', director, { title: '登记测试剧' }, 201);
+  const atScene = (await J(`/api/plays/${p3.id}/scenes`, director, { code: 'T1', title: '登记场' }, 201)).id;
+  const atRoleA = (await J(`/api/plays/${p3.id}/roles`, director, { code: 'TA', name: '甲' }, 201)).id;
+  const atRoleB = (await J(`/api/plays/${p3.id}/roles`, director, { code: 'TB', name: '乙' }, 201)).id;
+  const atRoleC = (await J(`/api/plays/${p3.id}/roles`, director, { code: 'TC', name: '丙' }, 201)).id;
+  await J(`/api/plays/${p3.id}/lines`, director, { sceneId: atScene, roleId: atRoleA, text: '甲词一', seq: 1 }, 201);
+  await J(`/api/plays/${p3.id}/lines`, director, { sceneId: atScene, roleId: atRoleB, text: '乙词一', seq: 2 }, 201);
+  await J(`/api/plays/${p3.id}/lines`, director, { sceneId: atScene, roleId: atRoleC, text: '丙词一', seq: 3 }, 201);
+  const atV1 = (await J(`/api/plays/${p3.id}/publish-initial`, director, { note: 'v1' }, 201)).version.id;
+  const rhF = (await J(`/api/plays/${p3.id}/rehearsals`, director, { versionId: atV1, name: '登记排练' }, 201)).id;
+  await J(`/api/rehearsals/${rhF}/cast`, director, { roleId: atRoleA, actorId: linId }, 201);
+  await J(`/api/rehearsals/${rhF}/cast`, director, { roleId: atRoleB, actorId: chenId }, 201);
+  const schF1 = (await J(`/api/rehearsals/${rhF}/schedules`, director, { sceneId: atScene, startAt: '2030-02-10T10:00:00+08:00', endAt: '2030-02-10T11:00:00+08:00' }, 201)).schedule;
+  check('未开启时日程无登记摘要', schF1.attendance === null);
+  await J(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance`, lin, {}, 403);
+  await G(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance`, director, 404);
+  check('演员不能开启登记；未开启时查询 404', true);
+
+  const att1 = (await J(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance`, director, {}, 201)).attendance;
+  check('开启登记冻结应到名单（当时有台词且已派角）', att1.roster.length === 2 && att1.roster.every((x) => [linId, chenId].includes(x.actorId)), JSON.stringify(att1.roster));
+  check('未派角角色记为缺口且不计应到', att1.gaps.length === 1 && att1.gaps[0].roleId === atRoleC && att1.stats.expected === 2);
+  check('开启时冻结场次/UTC时段/固定版本', att1.sceneId === atScene && att1.versionId === atV1 && att1.startAt === '2030-02-10T02:00:00.000Z' && att1.endAt === '2030-02-10T03:00:00.000Z');
+  const attDup = await J(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance`, director, {}, 409);
+  check('已有登记的时段不得再次开启', attDup.error === 'ATTENDANCE_EXISTS');
+
+  // 签到：仅名单内演员本人、仅开放期；重试返回首次结果
+  await J(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance/checkin`, director, {}, 403);
+  await J(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance/checkin`, zhou, {}, 403);
+  check('导演与名单外演员不能签到', true);
+  const ci1 = await J(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance/checkin`, lin, {}, 200);
+  check('名单内演员可在开放期签到', ci1.ok === true && !!ci1.checkedInAt && ci1.alreadyCheckedIn === false);
+  const ci2 = await J(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance/checkin`, lin, {}, 200);
+  check('重复签到返回首次结果（幂等）', ci2.alreadyCheckedIn === true && ci2.checkedInAt === ci1.checkedInAt);
+
+  // 不回写：开启后新派角/调整日程/换版均不改变已冻结的名单、版本与时段
+  await J(`/api/rehearsals/${rhF}/cast`, director, { roleId: atRoleC, actorId: zhouId }, 201);
+  await J(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance/checkin`, zhou, {}, 403);
+  check('开启后加入的演员不能签到该次登记', true);
+  await req('PATCH', `/api/rehearsals/${rhF}/schedules/${schF1.id}`, director, { startAt: '2030-02-10T12:00:00+08:00', endAt: '2030-02-10T13:00:00+08:00' }, 200);
+  const p3detail = await G(`/api/plays/${p3.id}`, director);
+  const atLineA = p3detail.lines.find((l) => l.roleId === atRoleA);
+  const revF = await J(`/api/plays/${p3.id}/revisions`, director, { title: '改甲词' }, 201);
+  await J(`/api/revisions/${revF.id}/items`, director, { action: 'modify', lineId: atLineA.id, oldText: '甲词一', newText: '甲词一改' }, 201);
+  const atV2 = (await J(`/api/plays/${p3.id}/publish`, director, { revisionIds: [revF.id] }, 201)).newVersion.id;
+  await J(`/api/rehearsals/${rhF}/switch-version`, director, { versionId: atV2 }, 200);
+  const attFrozen = (await G(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance`, director)).attendance;
+  check('改派/调日程/换版不回写：名单、缺口、版本、时段保持冻结',
+    attFrozen.roster.length === 2 && attFrozen.gaps.length === 1 && attFrozen.versionId === atV1 && attFrozen.startAt === '2030-02-10T02:00:00.000Z',
+    JSON.stringify({ roster: attFrozen.roster.length, versionId: attFrozen.versionId, startAt: attFrozen.startAt }));
+
+  // 关闭：未签到者记缺席；再关闭/再签到被拒
+  const attClosed = (await J(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance/close`, director, {}, 200)).attendance;
+  check('关闭后未签到者记缺席', attClosed.stats.present === 1 && attClosed.stats.absent === 1 && attClosed.roster.find((x) => x.actorId === chenId).attendance === 'absent');
+  await J(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance/close`, director, {}, 409);
+  await J(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance/checkin`, chen, {}, 409);
+  check('关闭后再次关闭与签到均被拒', true);
+
+  // 演员视角：仅本人记录
+  const linAtt = (await G(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance`, lin)).attendance;
+  check('演员只看本人记录（无名单/缺口）', !linAtt.roster && !linAtt.gaps && linAtt.myRecord.onRoster === true && linAtt.myRecord.checkedInAt === ci1.checkedInAt);
+  const chenAtt = (await G(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance`, chen)).attendance;
+  check('本人记录含缺席标记', chenAtt.myRecord.attendance === 'absent');
+
+  // 关闭后取消日程：仅标注取消，原统计保留
+  await J(`/api/rehearsals/${rhF}/schedules/${schF1.id}/cancel`, director, {}, 200);
+  const attKept = (await G(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance`, director)).attendance;
+  check('关闭后取消日程仅标注取消，原统计保留', attKept.status === 'closed' && attKept.scheduleCancelled === true && attKept.stats.present === 1 && attKept.stats.absent === 1 && attKept.stats.counted === true);
+
+  console.log('— 到场登记：开放期取消日程作废 / 状态守卫 —');
+  const schF2 = (await J(`/api/rehearsals/${rhF}/schedules`, director, { sceneId: atScene, startAt: '2030-02-11T10:00:00+08:00', endAt: '2030-02-11T11:00:00+08:00' }, 201)).schedule;
+  const att2 = (await J(`/api/rehearsals/${rhF}/schedules/${schF2.id}/attendance`, director, {}, 201)).attendance;
+  check('新登记按开启时名单冻结（含后派演员，无缺口）', att2.roster.length === 3 && att2.gaps.length === 0);
+  await J(`/api/rehearsals/${rhF}/schedules/${schF2.id}/attendance/checkin`, lin, {}, 200);
+  await J(`/api/rehearsals/${rhF}/schedules/${schF2.id}/cancel`, director, {}, 200);
+  const attVoid = (await G(`/api/rehearsals/${rhF}/schedules/${schF2.id}/attendance`, director)).attendance;
+  check('开放期取消日程：登记作废', attVoid.status === 'void');
+  check('作废保留签到痕迹但不计出勤', !!attVoid.roster.find((x) => x.actorId === linId).checkedInAt && attVoid.stats.counted === false);
+  await J(`/api/rehearsals/${rhF}/schedules/${schF2.id}/attendance/checkin`, chen, {}, 409);
+  await J(`/api/rehearsals/${rhF}/schedules/${schF2.id}/attendance/close`, director, {}, 409);
+  check('作废后签到与关闭均被拒', true);
+  const dirSchedF = await G(`/api/rehearsals/${rhF}/schedules`, director);
+  check('日程列表携带登记状态摘要',
+    dirSchedF.schedules.find((s) => s.id === schF1.id).attendance?.status === 'closed' &&
+    dirSchedF.schedules.find((s) => s.id === schF2.id).attendance?.status === 'void');
+
+  // 取消派角不回写名单；与该排练无关的演员不可见
+  await D(`/api/rehearsals/${rhF}/cast/${atRoleC}`, director);
+  await D(`/api/rehearsals/${rhF}/cast/${atRoleB}`, director);
+  const attAfterUncast = (await G(`/api/rehearsals/${rhF}/schedules/${schF2.id}/attendance`, director)).attendance;
+  check('取消派角不回写已冻结名单', attAfterUncast.roster.length === 3);
+  await G(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance`, zhou, 403);
+  const chenAtt2 = (await G(`/api/rehearsals/${rhF}/schedules/${schF1.id}/attendance`, chen)).attendance;
+  check('名单成员即使后被取消派角仍可见本人记录', chenAtt2.myRecord.onRoster === true && chenAtt2.myRecord.attendance === 'absent');
+
+  // 已取消/待调整的时段不得开启
+  await J(`/api/rehearsals/${rhD}/schedules/${schD1.id}/attendance`, director, {}, 400);
+  await J(`/api/rehearsals/${rhE}/schedules/${schE1.id}/attendance`, director, {}, 400);
+  check('已取消/待调整的时段不得开启登记', true);
+
   console.log(failures === 0 ? '\n全部通过 🎉' : `\n${failures} 项失败`);
   process.exit(failures === 0 ? 0 : 1);
 }

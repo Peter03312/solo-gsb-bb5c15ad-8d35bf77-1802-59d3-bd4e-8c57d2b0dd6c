@@ -1,6 +1,10 @@
 /* 导演：排练与确认 + 总览 */
 const SCHED_STATUS_LABEL = { active: '有效', needs_adjustment: '待调整', cancelled: '已取消' };
 const SCHED_STATUS_CLASS = { active: 'done', needs_adjustment: 'pending', cancelled: 'abandoned' };
+const ATT_STATUS_LABEL = { open: '登记开放中', closed: '登记已关闭', void: '登记已作废' };
+const ATT_STATUS_CLASS = { open: 'pending', closed: 'done', void: 'abandoned' };
+const ATT_ROW_LABEL = { pending: '待签到', present: '已签到', absent: '缺席', void: '作废' };
+const ATT_ROW_CLASS = { pending: 'pending', present: 'done', absent: 'abandoned', void: 'abandoned' };
 
 function fmtTime(iso) {
   return new Date(iso).toLocaleString('zh-CN', { hour12: false });
@@ -187,6 +191,7 @@ function renderRehearsalDetail(data, reload) {
     <div style="margin-top:8px">
       <h3>日程安排（带时区时段；重叠即冲突，端点相接不算）</h3>
       <div class="schedRows muted">加载中…</div>
+      <div class="attPanel"></div>
       <form class="flex schedForm" style="margin-top:6px">
         <select name="sceneId" class="sceneSel" style="max-width:180px"></select>
         <input type="datetime-local" name="startAt" required style="max-width:210px" />
@@ -260,19 +265,38 @@ function setupScheduleEditor(schedBox, rehearsal) {
       return;
     }
     rowsBox.innerHTML = `<table>
-      <tr><th>场次</th><th>时间</th><th>状态</th><th>参与演员</th><th>待补派</th><th>操作</th></tr>
+      <tr><th>场次</th><th>时间</th><th>状态</th><th>参与演员</th><th>待补派</th><th>到场登记</th><th>操作</th></tr>
       ${schedules.map((s) => `<tr>
         <td>${esc(s.sceneCode)} ${esc(s.sceneTitle)}</td>
         <td>${fmtTime(s.startAt)} → ${fmtTime(s.endAt)}</td>
         <td><span class="badge ${SCHED_STATUS_CLASS[s.status]}">${SCHED_STATUS_LABEL[s.status]}</span></td>
         <td>${s.participants.map((p) => esc(p.actorName)).join('、') || '<span class="muted">无</span>'}</td>
         <td>${s.pendingCast.map((p) => esc(p.roleName)).join('、') || '—'}</td>
+        <td>${s.attendance
+          ? `<span class="badge ${ATT_STATUS_CLASS[s.attendance.status]}">${ATT_STATUS_LABEL[s.attendance.status]}</span>
+             <button class="btn small attView" data-id="${s.id}">详情</button>`
+          : (s.status === 'active'
+              ? `<button class="btn small openAtt" data-id="${s.id}">开启登记</button>`
+              : '<span class="muted">—</span>')}</td>
         <td>${s.status !== 'cancelled'
           ? `<button class="btn small editSched" data-id="${s.id}">调整</button>
              <button class="btn small danger cancelSched" data-id="${s.id}">取消</button>`
           : ''}</td>
       </tr>`).join('')}
     </table>`;
+    rowsBox.querySelectorAll('.openAtt').forEach((b) =>
+      b.addEventListener('click', async () => {
+        try {
+          await api('POST', `/api/rehearsals/${rehearsal.id}/schedules/${b.dataset.id}/attendance`);
+          toast('到场登记已开启：场次/UTC时段/版本/应到名单已冻结');
+          reloadSchedules();
+          showAttendance(Number(b.dataset.id));
+        } catch (err) { toast(err.message, true); }
+      })
+    );
+    rowsBox.querySelectorAll('.attView').forEach((b) =>
+      b.addEventListener('click', () => showAttendance(Number(b.dataset.id)))
+    );
     rowsBox.querySelectorAll('.cancelSched').forEach((b) =>
       b.addEventListener('click', async () => {
         try {
@@ -316,6 +340,54 @@ function setupScheduleEditor(schedBox, rehearsal) {
       reloadSchedules();
     } catch (err) { toast(scheduleErr(err), true); }
   });
+
+  /** 到场登记详情：冻结的名单/缺口/统计；开放中可关闭（未签到者记缺席） */
+  async function showAttendance(scheduleId) {
+    const panel = schedBox.querySelector('.attPanel');
+    panel.innerHTML = '<span class="muted">加载登记详情…</span>';
+    let a;
+    try {
+      ({ attendance: a } = await api('GET', `/api/rehearsals/${rehearsal.id}/schedules/${scheduleId}/attendance`));
+    } catch (err) {
+      panel.innerHTML = `<span class="muted">${esc(err.message)}</span>`;
+      return;
+    }
+    panel.innerHTML = `
+      <div class="line-row" style="background:#faf8f4">
+        <div class="flex">
+          <strong class="grow">到场登记 #${a.id}（开启时冻结，后续改派/换版/调日程不回写）</strong>
+          <span class="badge ${ATT_STATUS_CLASS[a.status]}">${ATT_STATUS_LABEL[a.status]}</span>
+          ${a.scheduleCancelled && a.status !== 'void' ? '<span class="badge abandoned">日程已取消·统计保留</span>' : ''}
+        </div>
+        <div class="muted">${esc(a.sceneCode)} ${esc(a.sceneTitle)} · 冻结版本 v${a.versionNo} · ${fmtTime(a.startAt)} → ${fmtTime(a.endAt)}</div>
+        <div style="margin:4px 0">
+          应到 ${a.stats.expected} · 已签到 ${a.stats.present} · 缺席 ${a.stats.absent} · 待签到 ${a.stats.pending}
+          ${a.stats.counted ? '' : ' · <span class="badge abandoned">不计出勤（保留签到痕迹）</span>'}
+        </div>
+        <div class="muted">缺口（有台词未派角，不计应到）：${a.gaps.length ? a.gaps.map((g) => esc(g.roleName)).join('、') : '无'}</div>
+        <table style="margin-top:6px">
+          <tr><th>演员</th><th>角色</th><th>签到时间</th><th>状态</th></tr>
+          ${a.roster.map((x) => `<tr>
+            <td>${esc(x.actorName)}（@${esc(x.actorUsername)}）</td>
+            <td>${x.roles.map((r) => esc(r.roleName)).join('、')}</td>
+            <td>${x.checkedInAt ? fmtTime(x.checkedInAt) : '—'}</td>
+            <td><span class="badge ${ATT_ROW_CLASS[x.attendance]}">${ATT_ROW_LABEL[x.attendance]}</span></td>
+          </tr>`).join('')}
+        </table>
+        ${a.status === 'open' ? '<button class="btn small danger closeAtt" style="margin-top:6px">关闭登记（未签到者记缺席）</button>' : ''}
+      </div>`;
+    const closeBtn = panel.querySelector('.closeAtt');
+    if (closeBtn) {
+      closeBtn.addEventListener('click', async () => {
+        try {
+          await api('POST', `/api/rehearsals/${rehearsal.id}/schedules/${scheduleId}/attendance/close`);
+          toast('登记已关闭，未签到者已记缺席');
+          reloadSchedules();
+          showAttendance(scheduleId);
+        } catch (err) { toast(err.message, true); }
+      });
+    }
+  }
 
   reloadSchedules();
 }
@@ -411,13 +483,21 @@ async function loadActorScript(rehearsalId) {
     ({ schedules: mySchedules } = await api('GET', `/api/rehearsals/${rehearsalId}/schedules`));
   } catch { mySchedules = []; }
   const schedCard = el('<div class="card"><h2>我的排练时段</h2><div class="mySched"></div></div>');
-  schedCard.querySelector('.mySched').innerHTML = mySchedules.length
-    ? mySchedules.map((s) => `
-      <div class="line-row">
-        <div class="meta">${esc(s.sceneCode)} ${esc(s.sceneTitle)} · ${(s.myRoles || []).map((r) => esc(r.roleName)).join('、')}</div>
-        <div>${fmtTime(s.startAt)} → ${fmtTime(s.endAt)}</div>
-      </div>`).join('')
-    : '<span class="muted">暂无日程安排</span>';
+  const mySchedBox = schedCard.querySelector('.mySched');
+  if (!mySchedules.length) {
+    mySchedBox.innerHTML = '<span class="muted">暂无日程安排</span>';
+  } else {
+    for (const s of mySchedules) {
+      const row = el(`
+        <div class="line-row">
+          <div class="meta">${esc(s.sceneCode)} ${esc(s.sceneTitle)} · ${(s.myRoles || []).map((r) => esc(r.roleName)).join('、')}</div>
+          <div>${fmtTime(s.startAt)} → ${fmtTime(s.endAt)}</div>
+          <div class="attArea" style="margin-top:4px"></div>
+        </div>`);
+      mySchedBox.appendChild(row);
+      if (s.attendance) renderMyAttendance(row.querySelector('.attArea'), rehearsalId, s.id);
+    }
+  }
   panel.appendChild(schedCard);
 
   const scenes = new Map();
@@ -470,4 +550,30 @@ async function loadActorScript(rehearsalId) {
 
 function reh2(r) {
   return `${r.name}（《${r.playTitle}》）`;
+}
+
+/** 演员：时段上的到场登记（仅本人记录）；开放中且在名单内未签到时可签到 */
+async function renderMyAttendance(area, rehearsalId, scheduleId) {
+  let a;
+  try {
+    ({ attendance: a } = await api('GET', `/api/rehearsals/${rehearsalId}/schedules/${scheduleId}/attendance`));
+  } catch { return; }
+  const mr = a.myRecord || { onRoster: false };
+  const badges = [];
+  if (a.status === 'void') badges.push('<span class="badge abandoned">登记已作废·不计出勤</span>');
+  if (!mr.onRoster) badges.push('<span class="muted">不在本次登记名单</span>');
+  else if (mr.checkedInAt) badges.push(`<span class="badge done">已签到 ${fmtTime(mr.checkedInAt)}</span>`);
+  else if (mr.attendance === 'absent') badges.push('<span class="badge abandoned">缺席</span>');
+  area.innerHTML = badges.join(' ');
+  if (a.status === 'open' && mr.onRoster && !mr.checkedInAt) {
+    const btn = el('<button class="btn small primary">签到</button>');
+    btn.addEventListener('click', async () => {
+      try {
+        const r = await api('POST', `/api/rehearsals/${rehearsalId}/schedules/${scheduleId}/attendance/checkin`);
+        toast(r.alreadyCheckedIn ? '已签到过，返回首次签到结果' : '签到成功');
+      } catch (err) { toast(err.message, true); }
+      renderMyAttendance(area, rehearsalId, scheduleId);
+    });
+    area.appendChild(btn);
+  }
 }

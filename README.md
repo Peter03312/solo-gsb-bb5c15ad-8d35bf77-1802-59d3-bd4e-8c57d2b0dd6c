@@ -47,6 +47,18 @@
 6. 导演可**取消**安排，并查看待补派、待调整与已取消的安排（`?status=` 可过滤）；
    演员只能看到**自己当前参与的有效时段**。
 
+### 到场登记（排练签到）
+
+1. 导演可为**有效**时段开启**一次**到场登记；开启时**冻结**场次、UTC 时段、当时固定版本，
+   以及当时本场有台词且已派角的演员名单（应到）。有台词但**未派角**的角色记为**缺口**，不计应到。
+   已取消、待调整的时段不得开启（`400`）；已有登记的时段不得再次开启（`409 ATTENDANCE_EXISTS`）。
+2. 名单内演员仅能在**开放期**为本人签到；重复签到返回**首次签到结果**（幂等，不更新时间）。
+   导演**关闭**后，未签到者记**缺席**；之后再签到、再关闭均被拒（`409 ATTENDANCE_CLOSED`）。
+3. 改派、换版、调整日程均**不回写**名单与签到；开启后才加入的演员不能签到该次登记（`403`）。
+4. 开放期内日程被取消 → 登记**作废**（`void`）：停止签到，保留签到痕迹但不计出勤
+   （`stats.counted=false`）；关闭后日程被取消 → 仅标注 `scheduleCancelled`，原统计保留。
+5. 导演可查看名单、缺口与状态统计；演员只能看到**本人记录**。
+
 ## 一键启动（Docker，推荐）
 
 前置：已安装 Docker 与 Docker Compose v2。
@@ -123,10 +135,11 @@ PORT=8080 docker compose up --build -d
 - **导演 → 修订发布**：选基准版本建修订、逐条添加改/增/删（界面可一键填入所选台词原文）、
   勾选多个修订发布；冲突时页面展示每处冲突的“修订声称原文 vs 现行文本”，并可在发布记录中回看。
 - **导演 → 排练与确认**：创建固定版本的排练、显式换版、派角/改派，查看待确认清单与冲突；
-  为场次安排/调整/取消带时区的排练时段，查看参与者与待补派。
+  为场次安排/调整/取消带时区的排练时段，查看参与者与待补派；为有效时段**开启到场登记**，
+  查看冻结名单/缺口/统计并**关闭登记**（未签到者记缺席）。
 - **导演 → 总览**：所有排练的待确认汇总与最近冲突详情。
 - **演员**：进入排练后仅显示本人角色台词，按场次点“确认本场台词”；换版或改派后相应场次会回到待确认；
-  可查看自己当前参与的排练时段。
+  可查看自己当前参与的排练时段，并在登记开放期为本人**签到**。
 
 ## HTTP API 摘要（均返回 JSON，会话用 Cookie 或 `Authorization: Bearer <token>`）
 
@@ -152,12 +165,16 @@ PORT=8080 docker compose up --build -d
 | POST | `/api/rehearsals/:id/confirm` | 演员逐场确认 |
 | POST/GET | `/api/rehearsals/:id/schedules` | 安排时段（导演）/ 日程列表（导演含待补派·待调整·已取消，`?status=` 可过滤；演员仅自己参与的有效时段） |
 | PATCH | `/api/rehearsals/:id/schedules/:sid` | 调整时段/场次（导演；待调整的时段借此恢复有效） |
-| POST | `/api/rehearsals/:id/schedules/:sid/cancel` | 取消时段（导演，记录保留可查） |
+| POST | `/api/rehearsals/:id/schedules/:sid/cancel` | 取消时段（导演，记录保留可查；开放中的登记随之作废） |
+| POST/GET | `/api/rehearsals/:id/schedules/:sid/attendance` | 开启到场登记（导演，冻结名单/版本/时段，每时段一次）/ 查看（导演：名单·缺口·统计；演员：仅本人记录） |
+| POST | `/api/rehearsals/:id/schedules/:sid/attendance/checkin` | 演员本人签到（开放期；重试返回首次结果） |
+| POST | `/api/rehearsals/:id/schedules/:sid/attendance/close` | 关闭登记（导演；未签到者记缺席） |
 | GET | `/api/dashboard` | 导演总览 |
 
 错误统一形如 `{ "error": "CODE", "message": "...", "details": ... }`，
-典型状态码：`400`（无效版本/场次/参数）、`401`（未登录）、`403`（越权）、`404`（不存在）、
-`409`（业务冲突，如 `OLD_TEXT_MISMATCH`、`PUBLISH_CONFLICT`、`SCHEDULE_CONFLICT`）。
+典型状态码：`400`（无效版本/场次/参数、已取消或待调整时段开启登记）、`401`（未登录）、`403`（越权）、`404`（不存在）、
+`409`（业务冲突，如 `OLD_TEXT_MISMATCH`、`PUBLISH_CONFLICT`、`SCHEDULE_CONFLICT`、
+`ATTENDANCE_EXISTS`、`ATTENDANCE_CLOSED`、`ATTENDANCE_VOID`）。
 
 ## 日程接口调用示例（curl）
 
@@ -213,11 +230,58 @@ curl -s "http://localhost:3000/api/rehearsals/1/schedules" \
 同样做日程冲突校验：若新的参与演员与其他未取消时段重叠，返回 `409 SCHEDULE_CONFLICT` 且整次操作不生效
 （换版失败时版本与确认均不变）；换版成功时响应新增 `needsAdjustmentSchedules`（被标为待调整的时段 id 列表）。
 
+## 到场登记接口调用示例（curl）
+
+```bash
+# 1. 导演为有效时段开启到场登记（冻结场次/UTC时段/固定版本/应到名单；未派角角色记为缺口）
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/attendance \
+  -H "Authorization: Bearer <TOKEN>"
+# -> 201 {"attendance":{"id":1,"status":"open","sceneId":1,"versionId":1,"versionNo":1,
+#        "startAt":"2026-10-10T06:00:00.000Z","endAt":"2026-10-10T07:30:00.000Z",
+#        "scheduleStatus":"active","scheduleCancelled":false,
+#        "gaps":[{"roleId":3,"roleCode":"...","roleName":"..."}],
+#        "roster":[{"actorId":2,"actorName":"林晚","roles":[...],"checkedInAt":null,"attendance":"pending"}, ...],
+#        "stats":{"expected":2,"present":0,"absent":0,"pending":2,"counted":true}, ...}}
+#    已取消/待调整的时段 -> 400；已有登记 -> 409 {"error":"ATTENDANCE_EXISTS", ...}
+
+# 2. 名单内演员在开放期为本人签到；重试返回首次签到结果（幂等）
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/attendance/checkin \
+  -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> {"ok":true,"alreadyCheckedIn":false,"checkedInAt":"2026-10-10T06:01:23.456Z"}
+#    再次签到 -> {"ok":true,"alreadyCheckedIn":true,"checkedInAt":"<首次时间>"}
+#    不在名单（含开启后才派角的演员）-> 403；登记已关闭/已作废 -> 409
+
+# 3. 查看登记：导演得名单/缺口/统计；演员同一接口仅见本人记录（myRecord）
+curl -s http://localhost:3000/api/rehearsals/1/schedules/1/attendance \
+  -H "Authorization: Bearer <TOKEN>"
+curl -s http://localhost:3000/api/rehearsals/1/schedules/1/attendance \
+  -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> 演员：{"attendance":{"id":1,"status":"open",...,"myRecord":{"onRoster":true,
+#        "roles":[...],"checkedInAt":"...","attendance":"present"}}}
+
+# 4. 导演关闭登记：未签到者记缺席；再签到/再关闭 -> 409 ATTENDANCE_CLOSED
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/attendance/close \
+  -H "Authorization: Bearer <TOKEN>"
+# -> {"ok":true,"attendance":{"status":"closed",
+#        "roster":[...{"actorName":"陈默","attendance":"absent"}],
+#        "stats":{"expected":2,"present":1,"absent":1,"pending":0,"counted":true}}}
+
+# 5. 日程取消的联动（POST /api/rehearsals/1/schedules/1/cancel）：
+#    开放期取消 -> 登记 void：停止签到，保留签到痕迹，stats.counted=false（不计出勤）
+#    关闭后取消 -> 仅 scheduleCancelled=true 标注，原统计保留
+```
+
+日程列表（`GET /api/rehearsals/:id/schedules`）中每个时段新增 `attendance` 摘要
+（`{"id":…,"status":"open|closed|void"}` 或 `null`），便于页面直接展示登记入口与状态。
+登记开启后，改派、换版、调整日程均不回写名单与签到；开启后才派角的演员签到会得到 `403`。
+
 ## 测试
 
 端到端测试会用临时数据目录自动起停服务器，覆盖：认证与越权、修订原文校验、
 多种发布冲突与幂等合并、版本快照不可改写触发器、换版后按内容变化重确认、改派后原确认失效、
-日程时段校验与重叠冲突（含跨时区/端点相接/跨排练）、派角与换版的日程冲突回滚、待调整与已取消可见性等：
+日程时段校验与重叠冲突（含跨时区/端点相接/跨排练）、派角与换版的日程冲突回滚、待调整与已取消可见性、
+到场登记（开启冻结名单/版本/时段、缺口不计应到、签到幂等、关闭记缺席、改派换版调日程不回写、
+开放期取消作废不计出勤、关闭后取消保留统计、演员仅见本人记录）等：
 
 ```bash
 npm test
@@ -237,6 +301,7 @@ src/
   revisions.js     修订与发布（冲突检测核心）
   rehearsals.js    排练、派角、换版、逐场确认
   schedules.js     排练日程（带时区时段、参与者/待补派、重叠冲突检测）
+  attendance.js    到场登记（开启冻结名单/版本/时段、签到、关闭记缺席、作废联动）
   server.js        Express 入口
 public/            原生 JS 单页前端
 scripts/           安装兜底脚本与端到端测试

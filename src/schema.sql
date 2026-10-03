@@ -207,6 +207,45 @@ CREATE TABLE IF NOT EXISTS rehearsal_schedules (
 );
 CREATE INDEX IF NOT EXISTS idx_schedules_rehearsal ON rehearsal_schedules(rehearsal_id);
 
+-- 到场登记：导演为“有效”时段开启的一次性签到登记。
+--   * 每个时段至多一次登记（schedule_id 唯一）；开启时冻结场次、UTC 时段、固定版本与应到名单
+--   * status: open=开放签到；closed=已关闭（未签到者记缺席）；void=开放期日程被取消而作废（不计出勤）
+--   * 改派/换版/调整日程不回写本表与名单；关闭后日程被取消仅由日程状态标注，原统计保留
+CREATE TABLE IF NOT EXISTS attendance_sessions (
+  id           INTEGER PRIMARY KEY,
+  schedule_id  INTEGER NOT NULL UNIQUE REFERENCES rehearsal_schedules(id) ON DELETE CASCADE,
+  rehearsal_id INTEGER NOT NULL REFERENCES rehearsals(id) ON DELETE CASCADE,
+  scene_id     INTEGER NOT NULL,          -- 冻结：开启时的场次
+  version_id   INTEGER NOT NULL,          -- 冻结：开启时排练固定版本
+  start_at     TEXT NOT NULL,             -- 冻结：UTC 时段（不随日程调整而变）
+  end_at       TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'open'
+                 CHECK (status IN ('open', 'closed', 'void')),
+  opened_by    INTEGER REFERENCES users(id),
+  opened_at    TEXT NOT NULL,
+  closed_at    TEXT,
+  voided_at    TEXT
+);
+
+-- 应到名单（开启时冻结：当时本场有台词且已派角的演员）；
+-- checked_in_at 为空且登记已关闭 => 缺席；作废登记的签到时间仅作痕迹保留
+CREATE TABLE IF NOT EXISTS attendance_roster (
+  id            INTEGER PRIMARY KEY,
+  session_id    INTEGER NOT NULL REFERENCES attendance_sessions(id) ON DELETE CASCADE,
+  actor_id      INTEGER NOT NULL REFERENCES users(id),
+  roles_json    TEXT NOT NULL,            -- 冻结：该演员当时所派且本场有台词的角色
+  checked_in_at TEXT,
+  UNIQUE (session_id, actor_id)
+);
+
+-- 缺口（开启时冻结：本场有台词但未派角的角色，仅展示，不计应到）
+CREATE TABLE IF NOT EXISTS attendance_gaps (
+  id         INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES attendance_sessions(id) ON DELETE CASCADE,
+  role_id    INTEGER NOT NULL REFERENCES roles(id),
+  UNIQUE (session_id, role_id)
+);
+
 -- 演员按“所派角色 × 场次”确认；content_hash 对应确认时排练固定版本的台词文本。
 -- 唯一键含 actor_id：角色改派后保留原演员的历史确认（不计入），新演员需重新确认。
 CREATE TABLE IF NOT EXISTS confirmations (

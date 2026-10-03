@@ -262,7 +262,7 @@ function sceneBrief(sceneId) {
   return { sceneCode: scene?.code ?? null, sceneTitle: scene?.title ?? null };
 }
 
-/** 导演视图：含参与者与待补派 */
+/** 导演视图：含参与者与待补派；attendance 为该时段到场登记摘要（无登记为 null） */
 function serializeSchedule(s, rehearsal) {
   const { participants, pendingCast } = participantDetails(rehearsal.id, rehearsal.version_id, s.scene_id);
   return {
@@ -275,12 +275,32 @@ function serializeSchedule(s, rehearsal) {
     status: s.status,
     participants,
     pendingCast,
+    attendance: attendanceSummary(s.id),
     createdAt: s.created_at,
     cancelledAt: s.cancelled_at,
   };
 }
 
-/** 演员视图：只看自己当前参与的有效时段 */
+/** 到场登记摘要（导演）：状态与统计；作废的登记不计出勤 */
+function attendanceSummary(scheduleId) {
+  const a = db.prepare('SELECT * FROM attendance_sessions WHERE schedule_id = ?').get(scheduleId);
+  if (!a) return null;
+  const rows = db.prepare('SELECT checked_in_at FROM attendance_roster WHERE session_id = ?').all(a.id);
+  const expected = rows.length;
+  const checkedIn = rows.filter((x) => x.checked_in_at).length;
+  const counted = a.status !== 'voided';
+  return {
+    id: a.id,
+    status: a.status,
+    expected,
+    checkedIn,
+    absent: counted && a.status === 'closed' ? expected - checkedIn : 0,
+    counted,
+    scheduleCancelled: !!a.schedule_cancelled,
+  };
+}
+
+/** 演员视图：只看自己当前参与的有效时段；attendance 为本人登记状态（不在名单为 null） */
 function serializeScheduleForActor(s, rehearsal, actorId) {
   const { participants } = participantDetails(rehearsal.id, rehearsal.version_id, s.scene_id);
   const me = participants.find((p) => p.actorId === actorId);
@@ -293,7 +313,24 @@ function serializeScheduleForActor(s, rehearsal, actorId) {
     endAt: s.end_at,
     status: s.status,
     myRoles: me?.roles ?? [],
+    attendance: attendanceSummaryForActor(s.id, actorId),
   };
+}
+
+/** 到场登记摘要（演员）：仅本人在名单上时返回本人状态 */
+function attendanceSummaryForActor(scheduleId, actorId) {
+  const a = db.prepare('SELECT * FROM attendance_sessions WHERE schedule_id = ?').get(scheduleId);
+  if (!a) return null;
+  const mine = db
+    .prepare('SELECT checked_in_at FROM attendance_roster WHERE session_id = ? AND actor_id = ?')
+    .get(a.id, actorId);
+  if (!mine) return null;
+  let myState;
+  if (mine.checked_in_at) myState = 'checked_in';
+  else if (a.status === 'closed') myState = 'absent';
+  else if (a.status === 'open') myState = 'pending';
+  else myState = 'unmarked';
+  return { id: a.id, status: a.status, myState, checkedInAt: mine.checked_in_at };
 }
 
 /** 校验场次归属/当前版本有台词 + 起止时间（带时区、结束晚于开始） */
@@ -391,9 +428,20 @@ router.post(
     const r = getRehearsalOrThrow(req.params.id);
     const s = getScheduleOrThrow(req.params.scheduleId, r.id);
     if (s.status === 'cancelled') throw badRequest('该安排已取消');
-    db.prepare("UPDATE rehearsal_schedules SET status = 'cancelled', cancelled_at = datetime('now') WHERE id = ?").run(s.id);
+    transaction(() => {
+      db.prepare("UPDATE rehearsal_schedules SET status = 'cancelled', cancelled_at = datetime('now') WHERE id = ?").run(s.id);
+      // 到场登记联动（直接 SQL，避免引用 attendance.js 形成循环依赖）：
+      //   开放中的登记 -> 作废：停止签到，已签到痕迹保留但不计出勤；
+      //   已关闭的登记 -> 仅标注日程已取消，原统计保留。
+      const att = db.prepare('SELECT * FROM attendance_sessions WHERE schedule_id = ?').get(s.id);
+      if (att && att.status === 'open') {
+        db.prepare("UPDATE attendance_sessions SET status = 'voided' WHERE id = ?").run(att.id);
+      } else if (att && att.status === 'closed') {
+        db.prepare('UPDATE attendance_sessions SET schedule_cancelled = 1 WHERE id = ?').run(att.id);
+      }
+    });
     res.json({ ok: true, schedule: serializeSchedule(getScheduleOrThrow(s.id, r.id), r) });
   })
 );
 
-module.exports = { router, assertRehearsalSchedulesAfterCastChange, applySchedulesAfterVersionSwitch };
+module.exports = { router, assertRehearsalSchedulesAfterCastChange, applySchedulesAfterVersionSwitch, participantDetails };

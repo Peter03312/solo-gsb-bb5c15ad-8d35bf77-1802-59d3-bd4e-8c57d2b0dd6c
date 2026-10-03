@@ -207,6 +207,49 @@ CREATE TABLE IF NOT EXISTS rehearsal_schedules (
 );
 CREATE INDEX IF NOT EXISTS idx_schedules_rehearsal ON rehearsal_schedules(rehearsal_id);
 
+-- 到场登记：导演为“有效”日程时段开启的一次性签到。
+--   * 每个日程时段至多一次登记（schedule_id 唯一；已有登记——含已关闭/已作废——不得再开）
+--   * 开启时冻结：场次、UTC 起止时段、排练当时固定版本；此后改派/换版/调整日程均不回写
+--   * status: open=开放签到；closed=导演已关闭（未签到者记缺席）；voided=开放期间日程被取消
+--     （作废：停止签到，已签到痕迹保留但不计出勤）
+--   * schedule_cancelled=1：登记关闭后日程又被取消，仅标注，原统计保留
+CREATE TABLE IF NOT EXISTS attendance_sessions (
+  id                 INTEGER PRIMARY KEY,
+  schedule_id        INTEGER NOT NULL UNIQUE REFERENCES rehearsal_schedules(id) ON DELETE CASCADE,
+  rehearsal_id       INTEGER NOT NULL REFERENCES rehearsals(id) ON DELETE CASCADE,
+  scene_id           INTEGER NOT NULL REFERENCES scenes(id),
+  version_id         INTEGER NOT NULL REFERENCES versions(id),
+  start_at           TEXT NOT NULL,
+  end_at             TEXT NOT NULL,
+  status             TEXT NOT NULL DEFAULT 'open'
+                       CHECK (status IN ('open', 'closed', 'voided')),
+  opened_by          INTEGER REFERENCES users(id),
+  opened_at          TEXT NOT NULL DEFAULT (datetime('now')),
+  closed_by          INTEGER REFERENCES users(id),
+  closed_at          TEXT,
+  schedule_cancelled INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_attendance_rehearsal ON attendance_sessions(rehearsal_id);
+
+-- 登记名单（开启时冻结）：当时“本场次有台词且已派角”的演员；未派角角色不计应到。
+-- checked_in_at 为空 = 未签到；登记关闭后仍未签即缺席。后来加入者不在名单，不能签到。
+CREATE TABLE IF NOT EXISTS attendance_roster (
+  id            INTEGER PRIMARY KEY,
+  session_id    INTEGER NOT NULL REFERENCES attendance_sessions(id) ON DELETE CASCADE,
+  actor_id      INTEGER NOT NULL REFERENCES users(id),
+  roles_json    TEXT NOT NULL DEFAULT '[]',
+  checked_in_at TEXT,
+  UNIQUE (session_id, actor_id)
+);
+
+-- 缺口（开启时冻结）：当时本场次有台词但未派角的角色，仅展示，不计应到。
+CREATE TABLE IF NOT EXISTS attendance_gaps (
+  id         INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES attendance_sessions(id) ON DELETE CASCADE,
+  role_id    INTEGER NOT NULL REFERENCES roles(id),
+  UNIQUE (session_id, role_id)
+);
+
 -- 演员按“所派角色 × 场次”确认；content_hash 对应确认时排练固定版本的台词文本。
 -- 唯一键含 actor_id：角色改派后保留原演员的历史确认（不计入），新演员需重新确认。
 CREATE TABLE IF NOT EXISTS confirmations (

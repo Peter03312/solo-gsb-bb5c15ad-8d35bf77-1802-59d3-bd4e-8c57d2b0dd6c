@@ -47,6 +47,25 @@
 6. 导演可**取消**安排，并查看待补派、待调整与已取消的安排（`?status=` 可过滤）；
    演员只能看到**自己当前参与的有效时段**。
 
+### 到场登记（按时段一次性签到）
+
+1. 导演可为**有效**（`active`）日程时段**开启一次**到场登记；已取消、待调整或已有登记
+   （含已关闭/已作废）的时段不得开启（重复开启返回 `409 ATTENDANCE_EXISTS`）。
+2. **开启即冻结**：场次、UTC 起止时段、排练当时固定版本，以及当时“本场次有台词且已派角”
+   的演员名单；有台词但**未派角**的角色记为**缺口**，仅展示、**不计应到**。
+3. **签到**：仅名单内演员本人在开放期签到（首次 `201`）；**重试返回首次签到结果**
+   （`200`，`alreadyCheckedIn: true`，`checkedInAt` 为首次时间）；名单外演员（含开启后才派角的
+   **后来加入者**）与导演签到均 `403`。
+4. **关闭**：仅导演、仅开放中的登记；关闭后未签到者记**缺席**，后续签到
+   （`409 ATTENDANCE_NOT_OPEN`）与再次关闭（`400`）均拒绝。
+5. **不回写**：开启后的改派、换版、调整日程均不回写名单与签到——名单、缺口、冻结版本与
+   UTC 时段保持开启时快照；原演员被改派后仍在冻结名单内，仍可签到。
+6. **日程取消联动**：
+   - 开放期取消日程 → 登记**作废**（`voided`）：停止签到，已签到痕迹保留但**不计出勤**；
+   - 关闭后取消日程 → 仅标注 `scheduleCancelled`，原统计保留。
+7. **可见性**：导演查看名单、缺口与状态统计（应到/已签到/待签到或缺席/是否计入出勤）；
+   演员只看本人记录（不在名单上 `403`）。导演与演员的日程列表均带 `attendance` 摘要字段。
+
 ## 一键启动（Docker，推荐）
 
 前置：已安装 Docker 与 Docker Compose v2。
@@ -123,10 +142,11 @@ PORT=8080 docker compose up --build -d
 - **导演 → 修订发布**：选基准版本建修订、逐条添加改/增/删（界面可一键填入所选台词原文）、
   勾选多个修订发布；冲突时页面展示每处冲突的“修订声称原文 vs 现行文本”，并可在发布记录中回看。
 - **导演 → 排练与确认**：创建固定版本的排练、显式换版、派角/改派，查看待确认清单与冲突；
-  为场次安排/调整/取消带时区的排练时段，查看参与者与待补派。
+  为场次安排/调整/取消带时区的排练时段，查看参与者与待补派；对有效时段**开启/查看/关闭到场登记**
+  （名单、缺口、应到/签到/缺席统计）。
 - **导演 → 总览**：所有排练的待确认汇总与最近冲突详情。
 - **演员**：进入排练后仅显示本人角色台词，按场次点“确认本场台词”；换版或改派后相应场次会回到待确认；
-  可查看自己当前参与的排练时段。
+  可查看自己当前参与的排练时段，并在登记开放期为本人**到场签到**。
 
 ## HTTP API 摘要（均返回 JSON，会话用 Cookie 或 `Authorization: Bearer <token>`）
 
@@ -152,12 +172,17 @@ PORT=8080 docker compose up --build -d
 | POST | `/api/rehearsals/:id/confirm` | 演员逐场确认 |
 | POST/GET | `/api/rehearsals/:id/schedules` | 安排时段（导演）/ 日程列表（导演含待补派·待调整·已取消，`?status=` 可过滤；演员仅自己参与的有效时段） |
 | PATCH | `/api/rehearsals/:id/schedules/:sid` | 调整时段/场次（导演；待调整的时段借此恢复有效） |
-| POST | `/api/rehearsals/:id/schedules/:sid/cancel` | 取消时段（导演，记录保留可查） |
+| POST | `/api/rehearsals/:id/schedules/:sid/cancel` | 取消时段（导演，记录保留可查；联动到场登记见下） |
+| POST | `/api/rehearsals/:id/schedules/:sid/attendance` | 开启到场登记（导演；冻结名单/缺口/版本/UTC 时段，每时段至多一次） |
+| POST | `/api/rehearsals/:id/schedules/:sid/attendance/close` | 关闭登记（导演；未签到者记缺席） |
+| POST | `/api/rehearsals/:id/schedules/:sid/attendance/check-in` | 演员本人签到（开放期+名单内；重试返回首次结果） |
+| GET | `/api/rehearsals/:id/schedules/:sid/attendance` | 登记详情（导演：名单/缺口/统计；演员：仅本人记录） |
 | GET | `/api/dashboard` | 导演总览 |
 
 错误统一形如 `{ "error": "CODE", "message": "...", "details": ... }`，
-典型状态码：`400`（无效版本/场次/参数）、`401`（未登录）、`403`（越权）、`404`（不存在）、
-`409`（业务冲突，如 `OLD_TEXT_MISMATCH`、`PUBLISH_CONFLICT`、`SCHEDULE_CONFLICT`）。
+典型状态码：`400`（无效版本/场次/参数、状态不允许的操作）、`401`（未登录）、`403`（越权）、`404`（不存在）、
+`409`（业务冲突，如 `OLD_TEXT_MISMATCH`、`PUBLISH_CONFLICT`、`SCHEDULE_CONFLICT`、
+`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`）。
 
 ## 日程接口调用示例（curl）
 
@@ -213,11 +238,69 @@ curl -s "http://localhost:3000/api/rehearsals/1/schedules" \
 同样做日程冲突校验：若新的参与演员与其他未取消时段重叠，返回 `409 SCHEDULE_CONFLICT` 且整次操作不生效
 （换版失败时版本与确认均不变）；换版成功时响应新增 `needsAdjustmentSchedules`（被标为待调整的时段 id 列表）。
 
+## 到场登记接口调用示例（curl）
+
+```bash
+# 1. 导演登录，拿到 token（演员同理：lin / actor123）
+curl -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"director","password":"director123"}'
+# -> {"token":"<TOKEN>",...}
+
+# 2. 为有效时段开启到场登记（每个时段至多一次；已取消/待调整时段 400，重复开启 409）
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/attendance \
+  -H "Authorization: Bearer <TOKEN>"
+# -> 201 {"session":{"id":1,"status":"open","startAt":"2026-10-10T06:00:00.000Z",
+#        "versionId":1,"versionNo":1,
+#        "roster":[{"actorId":2,"actorName":"林晚","state":"pending","checkedInAt":null,...}, ...],
+#        "gaps":[{"roleId":3,"roleName":"船员"}],            <- 有台词未派角，不计应到
+#        "stats":{"expected":2,"checkedIn":0,"pending":2,"absent":0,"counted":true}}}
+#    场次、UTC 时段、固定版本、名单与缺口在开启这一刻冻结。
+
+# 3. 名单内演员本人签到（首次 201；重试 200 返回首次结果）
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/attendance/check-in \
+  -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> 201 {"checkIn":{"sessionId":1,"actorId":2,"checkedInAt":"2026-10-03T04:48:12.267Z",
+#        "alreadyCheckedIn":false}}
+# 再次调用 -> 200 {"checkIn":{...,"checkedInAt":"<首次时间>","alreadyCheckedIn":true}}
+# 名单外演员（含开启后才派角的后来加入者）-> 403
+
+# 4. 导演查看名单、缺口与统计；演员同一接口只看本人记录
+curl -s http://localhost:3000/api/rehearsals/1/schedules/1/attendance \
+  -H "Authorization: Bearer <TOKEN>"
+# 演员视角 -> {"session":{"id":1,"status":"open",...,"my":{"state":"checked_in",
+#              "checkedInAt":"...","roles":[...]}}}（无 roster/gaps 字段；不在名单上 403）
+
+# 5. 导演关闭登记：未签到者记缺席；此后签到 409、再次关闭 400
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules/1/attendance/close \
+  -H "Authorization: Bearer <TOKEN>"
+# -> {"session":{"status":"closed","stats":{"expected":2,"checkedIn":1,"absent":1,...},
+#        "roster":[{"actorName":"林晚","state":"checked_in",...},
+#                  {"actorName":"陈默","state":"absent",...}], ...}}
+
+# 6. 日程取消的联动（POST /api/rehearsals/1/schedules/1/cancel 之后）：
+#    - 登记仍开放 -> 变为 voided：停止签到（409），已签到痕迹保留但不计出勤
+#      （stats.counted=false，roster 中 checkedInAt 仍可查）；
+#    - 登记已关闭 -> 仅 scheduleCancelled=true，原统计保留。
+
+# 7. 日程列表自带登记摘要，无需逐个查询
+curl -s http://localhost:3000/api/rehearsals/1/schedules -H "Authorization: Bearer <TOKEN>"
+# -> {"schedules":[{"id":1,...,"attendance":{"id":1,"status":"closed","expected":2,
+#        "checkedIn":1,"absent":1,"counted":true,"scheduleCancelled":true}}]}
+# 演员列表中 attendance 为 {"id":1,"status":"open","myState":"pending","checkedInAt":null}
+# （本人不在该次登记名单上或未开启时为 null）。
+```
+
+开启登记后的改派、换版、调整日程（`PATCH /schedules/:sid`）均**不回写**名单与签到：
+登记响应中的 `versionId`、`startAt/endAt`、`roster`、`gaps` 始终保持开启时快照。
+
 ## 测试
 
 端到端测试会用临时数据目录自动起停服务器，覆盖：认证与越权、修订原文校验、
 多种发布冲突与幂等合并、版本快照不可改写触发器、换版后按内容变化重确认、改派后原确认失效、
-日程时段校验与重叠冲突（含跨时区/端点相接/跨排练）、派角与换版的日程冲突回滚、待调整与已取消可见性等：
+日程时段校验与重叠冲突（含跨时区/端点相接/跨排练）、派角与换版的日程冲突回滚、待调整与已取消可见性、
+到场登记（开启冻结名单/缺口、签到幂等、改派换版调日程不回写、关闭记缺席、开放期取消作废与关闭后取消标注、
+导演/演员可见性）等：
 
 ```bash
 npm test
@@ -236,7 +319,8 @@ src/
   plays.js         剧本、场次、角色、台词、版本
   revisions.js     修订与发布（冲突检测核心）
   rehearsals.js    排练、派角、换版、逐场确认
-  schedules.js     排练日程（带时区时段、参与者/待补派、重叠冲突检测）
+  schedules.js     排练日程（带时区时段、参与者/待补派、重叠冲突检测、取消联动登记）
+  attendance.js    到场登记（开启冻结名单/缺口、本人签到、关闭记缺席、作废与统计）
   server.js        Express 入口
 public/            原生 JS 单页前端
 scripts/           安装兜底脚本与端到端测试
